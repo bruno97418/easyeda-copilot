@@ -4,8 +4,11 @@ import crypto from 'node:crypto';
 const HOST = process.env.EASYEDA_ADAPTER_HOST || '127.0.0.1';
 const PORT = Number(process.env.EASYEDA_ADAPTER_PORT || 8790);
 const CODEX_BASE = process.env.EASYEDA_CODEX_INTERNAL_BASE || 'http://127.0.0.1:8791/v1';
-
+const MAX_RETRIES = Number(process.env.EASYEDA_CODEX_RETRIES || 2);
+const RETRY_DELAY_MS = Number(process.env.EASYEDA_CODEX_RETRY_DELAY_MS || 2500);
 const streams = new Map();
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 function headers(extra = {}) {
   return {
@@ -57,17 +60,38 @@ function extractPrompt(body) {
   return parts.filter(Boolean).join('\n\n');
 }
 
-async function runCodex(body) {
-  const prompt = extractPrompt(body);
-  if (!prompt) throw new Error('Aucun message utilisateur trouvé');
+function withDesignPolicy(prompt, retry = false) {
+  const policy = [
+    'RÈGLES PERMANENTES EASYEDA :',
+    '- Répondre uniquement en français.',
+    '- Pour toute création ou modification, utiliser uniquement le MCP easyeda-copilot pour agir dans EasyEDA.',
+    '- Avant de placer un composant, vérifier sa disponibilité actuelle chez LCSC/JLCPCB lorsque cette information est accessible.',
+    '- Utiliser la recherche web en direct si nécessaire pour confirmer les références LCSC, le statut Basic/Extended et le stock actuel.',
+    '- Ne pas sélectionner volontairement une référence à stock nul. Chercher automatiquement une alternative électriquement compatible.',
+    '- Pour une alternative, vérifier fonction, tension, courant, tolérance, température, boîtier/empreinte et brochage avant remplacement.',
+    '- Préférer les références JLCPCB Basic/standard, en stock élevé et avec une empreinte courante, à caractéristiques équivalentes.',
+    '- Si le stock exact ne peut pas être confirmé, ne pas inventer de quantité : indiquer STOCK NON VÉRIFIÉ et éviter ce composant critique si une référence vérifiée existe.',
+    '- À la fin d’une conception, fournir les références fabricant + LCSC utilisées et l’état de disponibilité vérifié.',
+    '- Avant de terminer, relire le schéma, vérifier les connexions, alimentations, masses, valeurs et corriger les erreurs évidentes.',
+  ];
 
+  if (retry) {
+    policy.push(
+      '- REPRISE APRÈS COUPURE : inspecter d’abord le schéma actuellement ouvert et reprendre la tâche sans dupliquer les composants ou réseaux déjà créés.'
+    );
+  }
+
+  return `${policy.join('\n')}\n\nDEMANDE UTILISATEUR :\n${prompt}`;
+}
+
+async function postCodex(prompt, retry = false) {
   const response = await fetch(`${CODEX_BASE}/chat/completions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       model: 'codex-chatgpt',
       stream: false,
-      messages: [{ role: 'user', content: prompt }],
+      messages: [{ role: 'user', content: withDesignPolicy(prompt, retry) }],
     }),
   });
 
@@ -75,10 +99,49 @@ async function runCodex(body) {
   if (!response.ok) {
     throw new Error(data?.error?.message || data?.error || `Codex bridge HTTP ${response.status}`);
   }
-
   const text = data?.choices?.[0]?.message?.content;
   if (!text) throw new Error('Réponse Codex vide');
   return String(text);
+}
+
+function isRetryable(error) {
+  const text = String(error?.message || error).toLowerCase();
+  return text.includes('fetch failed') ||
+    text.includes('transport channel closed') ||
+    text.includes('app server stopped') ||
+    text.includes('socket') ||
+    text.includes('econnreset') ||
+    text.includes('econnrefused');
+}
+
+async function waitForBridge() {
+  for (let i = 0; i < 20; i++) {
+    try {
+      const r = await fetch(`${CODEX_BASE}/health`);
+      if (r.ok) return true;
+    } catch {}
+    await sleep(1000);
+  }
+  return false;
+}
+
+async function runCodex(body) {
+  const prompt = extractPrompt(body);
+  if (!prompt) throw new Error('Aucun message utilisateur trouvé');
+
+  let lastError;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      return await postCodex(prompt, attempt > 0);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= MAX_RETRIES || !isRetryable(error)) throw error;
+      console.warn(`[easyeda-adapter] transport failure, retry ${attempt + 1}/${MAX_RETRIES}:`, error?.message || error);
+      await sleep(RETRY_DELAY_MS);
+      await waitForBridge();
+    }
+  }
+  throw lastError;
 }
 
 function sendSse(res, event, data, id) {
@@ -105,10 +168,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && req.url === '/v2/chat/s/stream/new') {
       const body = await readJson(req);
       const streamId = crypto.randomUUID();
-      const entry = {
-        promise: runCodex(body),
-        stopped: false,
-      };
+      const entry = { promise: runCodex(body), stopped: false, createdAt: Date.now() };
       streams.set(streamId, entry);
       entry.promise.catch(() => undefined);
       sendJson(res, 200, { streamId });
@@ -119,16 +179,18 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && streamMatch) {
       const streamId = decodeURIComponent(streamMatch[1]);
       const entry = streams.get(streamId);
-      if (!entry) {
-        sendJson(res, 404, { error: 'Unknown stream' });
-        return;
-      }
+      if (!entry) return sendJson(res, 404, { error: 'Unknown stream' });
 
       res.writeHead(200, headers({
         'Content-Type': 'text/event-stream; charset=utf-8',
-        'Cache-Control': 'no-cache',
+        'Cache-Control': 'no-cache, no-transform',
         Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
       }));
+
+      const heartbeat = setInterval(() => {
+        if (!res.writableEnded) res.write(': keep-alive\n\n');
+      }, 15000);
 
       try {
         const text = await entry.promise;
@@ -139,6 +201,7 @@ const server = http.createServer(async (req, res) => {
       } catch (error) {
         sendSse(res, 'error', JSON.stringify({ error: error instanceof Error ? error.message : String(error) }), '1');
       } finally {
+        clearInterval(heartbeat);
         streams.delete(streamId);
         res.end();
       }
@@ -162,7 +225,12 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+server.keepAliveTimeout = 10 * 60 * 1000;
+server.headersTimeout = 10 * 60 * 1000 + 5000;
+server.requestTimeout = 0;
+
 server.listen(PORT, HOST, () => {
   console.log(`[easyeda-adapter] Listening on http://${HOST}:${PORT}`);
   console.log(`[easyeda-adapter] Forwarding integrated EasyEDA chat to ${CODEX_BASE}`);
+  console.log(`[easyeda-adapter] Stock-aware policy enabled; retries=${MAX_RETRIES}`);
 });
