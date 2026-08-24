@@ -2,6 +2,7 @@ import http from 'node:http';
 import { spawn } from 'node:child_process';
 import readline from 'node:readline';
 import crypto from 'node:crypto';
+import { buildSchematicMethodRules, SCHEMATIC_METHOD_VERSION } from './schematic-method.mjs';
 
 const HOST = process.env.EASYEDA_CODEX_HOST || '127.0.0.1';
 const PORT = Number(process.env.EASYEDA_CODEX_PORT || 8790);
@@ -73,7 +74,7 @@ class CodexAppServerClient {
       clientInfo: {
         name: 'easyeda_copilot_local',
         title: 'EasyEDA Copilot Local Codex Bridge',
-        version: '0.4.0',
+        version: '0.5.0',
       },
       capabilities: { experimentalApi: false },
     });
@@ -196,15 +197,10 @@ class CodexAppServerClient {
       'Tu pilotes EasyEDA uniquement via le serveur MCP easyeda-copilot déjà configuré dans Codex.',
       'Utilise ce MCP pour lire ou modifier le document EasyEDA ouvert selon la demande.',
       'Ne modifie jamais le schéma lorsqu’il est demandé de seulement analyser, vérifier ou expliquer.',
-      'Pour toute conception, vérifie avant placement la disponibilité actuelle des composants chez LCSC/JLCPCB avec la recherche web en direct quand nécessaire.',
-      'N’invente jamais un stock. Si la quantité exacte n’est pas vérifiable, indique STOCK NON VÉRIFIÉ.',
-      'N’utilise pas volontairement une référence à stock nul si une alternative électriquement compatible et disponible existe.',
-      'Pour toute substitution, vérifie fonction, tension, courant, tolérance, température, boîtier, empreinte et brochage.',
-      'Privilégie JLCPCB Basic/standard, stock important et empreintes courantes à caractéristiques équivalentes.',
-      'À la fin, indique les références fabricant/LCSC utilisées et leur disponibilité vérifiée, puis relis le schéma et corrige les erreurs évidentes.',
+      ...buildSchematicMethodRules(),
     ];
-    if (recovery) rules.push('REPRISE APRÈS COUPURE : inspecte d’abord le schéma existant et continue sans dupliquer ce qui a déjà été créé.');
-    return `${rules.join('\n')}\n\n${userText}`;
+    if (recovery) rules.push('REPRISE APRÈS COUPURE : inspecte d’abord le schéma existant, compare références, positions, nets et blocs fonctionnels, puis continue sans dupliquer ce qui a déjà été créé.');
+    return `${rules.join('\n')}\n\nDEMANDE UTILISATEUR :\n${userText}`;
   }
 
   async runTurn(prompt) {
@@ -394,4 +390,5 @@ server.listen(PORT, HOST, () => {
   console.log(`[codex-bridge] OpenAI-compatible base URL: http://${HOST}:${PORT}/v1`);
   console.log('[codex-bridge] Uses your existing Codex ChatGPT login; no OpenAI API key is required.');
   console.log('[codex-bridge] EasyEDA MCP auto-approval + live stock-search policy enabled.');
+  console.log(`[codex-bridge] Generic Golden Schematic method v${SCHEMATIC_METHOD_VERSION} enabled (7805 is regression example only).`);
 });
