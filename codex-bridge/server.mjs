@@ -1,6 +1,7 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import readline from 'node:readline';
+import crypto from 'node:crypto';
 
 const HOST = process.env.EASYEDA_CODEX_HOST || '127.0.0.1';
 const PORT = Number(process.env.EASYEDA_CODEX_PORT || 8790);
@@ -66,7 +67,7 @@ class CodexAppServerClient {
       clientInfo: {
         name: 'easyeda_copilot_local',
         title: 'EasyEDA Copilot Local Codex Bridge',
-        version: '0.1.0',
+        version: '0.2.0',
       },
       capabilities: {
         experimentalApi: false,
@@ -153,14 +154,14 @@ class CodexAppServerClient {
   handleServerRequest(message) {
     const { id, method, params = {} } = message;
 
-    // The bridge never auto-approves shell or filesystem escalation.
+    // Never auto-approve shell commands or filesystem edits made by Codex itself.
+    // EasyEDA changes must go through the explicitly configured EasyEDA MCP server.
     if (method === 'item/commandExecution/requestApproval' || method === 'item/fileChange/requestApproval') {
       this.respond(id, { decision: 'decline' });
       return;
     }
 
-    // EasyEDA Copilot asks Codex for MCP tool approval through an MCP elicitation.
-    // Accept only the known local easyeda-copilot server; decline every other elicitation.
+    // Approve only MCP tool calls from the known EasyEDA Copilot MCP server.
     if (method === 'mcpServer/elicitation/request') {
       const meta = params?.meta || params?.request?.meta || {};
       const serverName = params.serverName || '';
@@ -213,30 +214,129 @@ class CodexAppServerClient {
 
 const codex = new CodexAppServerClient();
 
+function corsHeaders(extra = {}) {
+  return {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'content-type, authorization',
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+    ...extra,
+  };
+}
+
 function sendJson(res, status, data) {
   const body = JSON.stringify(data);
-  res.writeHead(status, {
+  res.writeHead(status, corsHeaders({
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(body),
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'content-type',
-    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-  });
+  }));
   res.end(body);
+}
+
+async function readJson(req) {
+  return await new Promise((resolve, reject) => {
+    let raw = '';
+    req.setEncoding('utf8');
+    req.on('data', (chunk) => {
+      raw += chunk;
+      if (raw.length > 4_000_000) {
+        reject(new Error('Request too large'));
+        req.destroy();
+      }
+    });
+    req.on('end', () => {
+      try {
+        resolve(JSON.parse(raw || '{}'));
+      } catch (error) {
+        reject(error);
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+function messageText(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.map((part) => {
+    if (typeof part === 'string') return part;
+    if (part?.type === 'text' || part?.type === 'input_text') return part.text || '';
+    return '';
+  }).filter(Boolean).join('\n');
+}
+
+function extractPromptFromChat(body) {
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const lastUser = [...messages].reverse().find((m) => m?.role === 'user');
+  if (lastUser) return messageText(lastUser.content);
+
+  const all = messages.map((m) => messageText(m?.content)).filter(Boolean);
+  return all.at(-1) || '';
+}
+
+function extractPromptFromResponses(body) {
+  if (typeof body.input === 'string') return body.input;
+  if (!Array.isArray(body.input)) return '';
+  const texts = [];
+  for (const item of body.input) {
+    if (typeof item === 'string') texts.push(item);
+    else if (item?.role === 'user') texts.push(messageText(item.content));
+    else if (item?.type === 'message' && item?.role === 'user') texts.push(messageText(item.content));
+  }
+  return texts.filter(Boolean).at(-1) || '';
+}
+
+function sendChatCompletion(res, text, model, stream) {
+  const id = `chatcmpl_${crypto.randomUUID().replaceAll('-', '')}`;
+  if (!stream) {
+    sendJson(res, 200, {
+      id,
+      object: 'chat.completion',
+      created: Math.floor(Date.now() / 1000),
+      model: model || 'codex-chatgpt',
+      choices: [{
+        index: 0,
+        message: { role: 'assistant', content: text },
+        finish_reason: 'stop',
+      }],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    });
+    return;
+  }
+
+  res.writeHead(200, corsHeaders({
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  }));
+
+  const first = {
+    id,
+    object: 'chat.completion.chunk',
+    created: Math.floor(Date.now() / 1000),
+    model: model || 'codex-chatgpt',
+    choices: [{ index: 0, delta: { role: 'assistant', content: text }, finish_reason: null }],
+  };
+  const last = {
+    id,
+    object: 'chat.completion.chunk',
+    created: Math.floor(Date.now() / 1000),
+    model: model || 'codex-chatgpt',
+    choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+  };
+  res.write(`data: ${JSON.stringify(first)}\n\n`);
+  res.write(`data: ${JSON.stringify(last)}\n\n`);
+  res.write('data: [DONE]\n\n');
+  res.end();
 }
 
 const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') {
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Headers': 'content-type',
-      'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-    });
+    res.writeHead(204, corsHeaders());
     res.end();
     return;
   }
 
-  if (req.method === 'GET' && req.url === '/health') {
+  if (req.method === 'GET' && (req.url === '/health' || req.url === '/v1/health')) {
     try {
       await codex.ensureReady();
       sendJson(res, 200, { ok: true, threadId: codex.threadId });
@@ -246,25 +346,69 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === 'GET' && req.url === '/v1/models') {
+    sendJson(res, 200, {
+      object: 'list',
+      data: [{ id: 'codex-chatgpt', object: 'model', owned_by: 'openai-chatgpt' }],
+    });
+    return;
+  }
+
   if (req.method === 'POST' && req.url === '/chat') {
-    let raw = '';
-    req.setEncoding('utf8');
-    req.on('data', (chunk) => {
-      raw += chunk;
-      if (raw.length > 2_000_000) req.destroy();
-    });
-    req.on('end', async () => {
-      try {
-        const body = JSON.parse(raw || '{}');
-        const message = String(body.message || '').trim();
-        if (!message) return sendJson(res, 400, { error: 'Message vide' });
-        const text = await codex.chat(message);
-        sendJson(res, 200, { text });
-      } catch (error) {
-        console.error('[codex-bridge] chat failed:', error);
-        sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
-      }
-    });
+    try {
+      const body = await readJson(req);
+      const message = String(body.message || '').trim();
+      if (!message) return sendJson(res, 400, { error: 'Message vide' });
+      const text = await codex.chat(message);
+      sendJson(res, 200, { text });
+    } catch (error) {
+      console.error('[codex-bridge] chat failed:', error);
+      sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/v1/chat/completions') {
+    try {
+      const body = await readJson(req);
+      const prompt = extractPromptFromChat(body).trim();
+      if (!prompt) return sendJson(res, 400, { error: { message: 'No user message found' } });
+      const text = await codex.chat(prompt);
+      sendChatCompletion(res, text, body.model, Boolean(body.stream));
+    } catch (error) {
+      console.error('[codex-bridge] chat completion failed:', error);
+      sendJson(res, 500, { error: { message: error instanceof Error ? error.message : String(error) } });
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/v1/responses') {
+    try {
+      const body = await readJson(req);
+      const prompt = extractPromptFromResponses(body).trim();
+      if (!prompt) return sendJson(res, 400, { error: { message: 'No user input found' } });
+      const text = await codex.chat(prompt);
+      const responseId = `resp_${crypto.randomUUID().replaceAll('-', '')}`;
+      sendJson(res, 200, {
+        id: responseId,
+        object: 'response',
+        created_at: Math.floor(Date.now() / 1000),
+        status: 'completed',
+        model: body.model || 'codex-chatgpt',
+        output: [{
+          id: `msg_${crypto.randomUUID().replaceAll('-', '')}`,
+          type: 'message',
+          status: 'completed',
+          role: 'assistant',
+          content: [{ type: 'output_text', text, annotations: [] }],
+        }],
+        output_text: text,
+        usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+      });
+    } catch (error) {
+      console.error('[codex-bridge] responses failed:', error);
+      sendJson(res, 500, { error: { message: error instanceof Error ? error.message : String(error) } });
+    }
     return;
   }
 
@@ -273,5 +417,6 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, HOST, () => {
   console.log(`[codex-bridge] Listening on http://${HOST}:${PORT}`);
+  console.log(`[codex-bridge] OpenAI-compatible base URL: http://${HOST}:${PORT}/v1`);
   console.log('[codex-bridge] Uses your existing Codex ChatGPT login; no OpenAI API key is required.');
 });
