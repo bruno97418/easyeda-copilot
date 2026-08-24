@@ -8,10 +8,9 @@ export interface AllSettings {
 // Явные значения по умолчанию
 const DEFAULT_SETTINGS = {
     // API Configuration
-    apiProvider: 'codex',
+    apiProvider: 'local',
     apiKey: '',
-    llmBaseUrl: '',
-    codexBridgeUrl: 'http://127.0.0.1:8790',
+    llmBaseUrl: 'http://127.0.0.1:8790/v1',
 
     // UI Preferences
     theme: 'light',
