@@ -8,9 +8,10 @@ export interface AllSettings {
 // Явные значения по умолчанию
 const DEFAULT_SETTINGS = {
     // API Configuration
-    apiProvider: 'openai',
+    apiProvider: 'codex',
     apiKey: '',
     llmBaseUrl: '',
+    codexBridgeUrl: 'http://127.0.0.1:8790',
 
     // UI Preferences
     theme: 'light',
