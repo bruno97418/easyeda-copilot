@@ -6,7 +6,7 @@
 	"version": "1.1.7",
 	"publisher": "biosshot",
 	"engines": {
-		"eda": "^3.2.149"
+		"eda": "^3.2.148"
 	},
 	"license": "MIT License",
 	"repository": {
@@ -49,6 +49,16 @@
 						"id": "MCP",
 						"title": "MCP",
 						"registerFn": "openMcp"
+					},
+					{
+						"id": "MCPConnection",
+						"title": "MCP connection...",
+						"registerFn": "configureMcpConnection"
+					},
+					{
+						"id": "MCPConnectionReset",
+						"title": "Reset MCP connection",
+						"registerFn": "resetMcpConnection"
 					},
 					{
 						"id": "Export",
@@ -94,6 +104,16 @@
 						"id": "MCP",
 						"title": "MCP",
 						"registerFn": "openMcp"
+					},
+					{
+						"id": "MCPConnection",
+						"title": "MCP connection...",
+						"registerFn": "configureMcpConnection"
+					},
+					{
+						"id": "MCPConnectionReset",
+						"title": "Reset MCP connection",
+						"registerFn": "resetMcpConnection"
 					},
 					{
 						"id": "Import",

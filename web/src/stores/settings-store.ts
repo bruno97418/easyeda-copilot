@@ -8,9 +8,9 @@ export interface AllSettings {
 // Явные значения по умолчанию
 const DEFAULT_SETTINGS = {
     // API Configuration
-    apiProvider: 'openai',
+    apiProvider: 'local',
     apiKey: '',
-    llmBaseUrl: '',
+    llmBaseUrl: 'http://127.0.0.1:8790/v1',
 
     // UI Preferences
     theme: 'light',

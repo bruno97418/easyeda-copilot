@@ -11,7 +11,8 @@
 		"build:vite": "vite build --mode development",
 		"compile": "rimraf ./dist/ && ts-node ./config/esbuild.prod.ts",
 		"eslint": "eslint ./web ./src",
-		"build": "node build.mjs && npm run compile && ts-node ./build/packaged.ts"
+		"build": "node build.mjs && npm run compile && ts-node ./build/packaged.ts",
+		"codex:bridge": "node ./codex-bridge/launcher.mjs"
 	},
 	"devDependencies": {
 		"@jlceda/pro-api-types": "^0.2.30",
