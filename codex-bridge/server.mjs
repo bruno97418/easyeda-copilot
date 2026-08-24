@@ -8,6 +8,7 @@ const HOST = process.env.EASYEDA_CODEX_HOST || '127.0.0.1';
 const PORT = Number(process.env.EASYEDA_CODEX_PORT || 8790);
 const CODEX_COMMAND = process.env.CODEX_COMMAND || (process.platform === 'win32' ? 'codex.cmd' : 'codex');
 const MAX_RECOVERY_RETRIES = Number(process.env.EASYEDA_CODEX_RECOVERY_RETRIES || 1);
+const TURN_TIMEOUT_MS = Number(process.env.EASYEDA_CODEX_TURN_TIMEOUT_MS || 20 * 60 * 1000);
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -19,6 +20,8 @@ class CodexAppServerClient {
     this.threadId = null;
     this.activeTurn = null;
     this.readyPromise = null;
+    this.chatQueue = Promise.resolve();
+    this.queueDepth = 0;
   }
 
   async ensureReady() {
@@ -52,6 +55,7 @@ class CodexAppServerClient {
         reject(error);
       }
       this.pending.clear();
+      if (this.activeTurn?.timer) clearTimeout(this.activeTurn.timer);
       if (this.activeTurn?.reject) this.activeTurn.reject(error);
       this.activeTurn = null;
       this.proc = null;
@@ -74,7 +78,7 @@ class CodexAppServerClient {
       clientInfo: {
         name: 'easyeda_copilot_local',
         title: 'EasyEDA Copilot Local Codex Bridge',
-        version: '0.5.0',
+        version: '0.6.0',
       },
       capabilities: { experimentalApi: false },
     });
@@ -146,6 +150,7 @@ class CodexAppServerClient {
     if (message.method === 'turn/completed' && this.activeTurn) {
       const active = this.activeTurn;
       this.activeTurn = null;
+      if (active.timer) clearTimeout(active.timer);
       const status = params.turn?.status || params.status;
       if (status === 'failed') active.reject(new Error(params.turn?.error?.message || params.error?.message || 'Codex turn failed'));
       else active.resolve(active.text.trim() || 'Terminé.');
@@ -203,20 +208,53 @@ class CodexAppServerClient {
     return `${rules.join('\n')}\n\nDEMANDE UTILISATEUR :\n${userText}`;
   }
 
+  async interruptActiveTurn(reason = 'timeout') {
+    const active = this.activeTurn;
+    if (!active) return;
+    console.warn(`[codex-bridge] Interrupting stale Codex turn (${reason})...`);
+    try {
+      await this.request('turn/interrupt', {
+        threadId: this.threadId,
+        ...(active.turnId ? { turnId: active.turnId } : {}),
+      }, 15000);
+    } catch (error) {
+      console.warn('[codex-bridge] Could not interrupt stale turn cleanly:', error instanceof Error ? error.message : String(error));
+    }
+  }
+
   async runTurn(prompt) {
     await this.ensureReady();
     if (!this.threadId) throw new Error('Codex thread is not ready');
-    if (this.activeTurn) throw new Error('A Codex turn is already running');
+    if (this.activeTurn) {
+      // This should not normally happen because chat() serializes requests.
+      // Wait briefly for a completion event instead of immediately failing the user request.
+      const deadline = Date.now() + 30000;
+      while (this.activeTurn && Date.now() < deadline) await sleep(250);
+      if (this.activeTurn) {
+        await this.interruptActiveTurn('unexpected overlap');
+        throw new Error('Previous Codex turn did not finish cleanly');
+      }
+    }
 
     return await new Promise(async (resolve, reject) => {
-      this.activeTurn = { text: '', resolve, reject };
+      const active = { text: '', resolve, reject, turnId: null, timer: null };
+      this.activeTurn = active;
+      active.timer = setTimeout(async () => {
+        if (this.activeTurn !== active) return;
+        await this.interruptActiveTurn('turn timeout');
+        if (this.activeTurn === active) this.activeTurn = null;
+        reject(new Error(`Codex turn timeout after ${Math.round(TURN_TIMEOUT_MS / 60000)} minutes`));
+      }, TURN_TIMEOUT_MS);
+
       try {
-        await this.request('turn/start', {
+        const started = await this.request('turn/start', {
           threadId: this.threadId,
           input: [{ type: 'text', text: prompt }],
         });
+        active.turnId = started?.turn?.id || started?.id || null;
       } catch (error) {
-        this.activeTurn = null;
+        if (active.timer) clearTimeout(active.timer);
+        if (this.activeTurn === active) this.activeTurn = null;
         reject(error);
       }
     });
@@ -227,7 +265,7 @@ class CodexAppServerClient {
     return text.includes('transport channel closed') || text.includes('app server stopped') || text.includes('broken pipe') || text.includes('econnreset');
   }
 
-  async chat(userText) {
+  async chatInternal(userText) {
     let lastError;
     for (let attempt = 0; attempt <= MAX_RECOVERY_RETRIES; attempt++) {
       try {
@@ -243,6 +281,20 @@ class CodexAppServerClient {
       }
     }
     throw lastError;
+  }
+
+  chat(userText) {
+    // One EasyEDA request = one Codex turn. New requests wait instead of colliding
+    // with a turn that is still finishing MCP work in the background.
+    this.queueDepth += 1;
+    const position = this.queueDepth;
+    if (position > 1) console.log(`[codex-bridge] Request queued (position ${position}); waiting for active Codex turn to finish.`);
+
+    const task = this.chatQueue.then(() => this.chatInternal(userText));
+    this.chatQueue = task.catch(() => {}).finally(() => {
+      this.queueDepth = Math.max(0, this.queueDepth - 1);
+    });
+    return task;
   }
 }
 
@@ -335,7 +387,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') { res.writeHead(204, corsHeaders()); res.end(); return; }
 
   if (req.method === 'GET' && (req.url === '/health' || req.url === '/v1/health')) {
-    try { await codex.ensureReady(); sendJson(res, 200, { ok: true, threadId: codex.threadId }); }
+    try { await codex.ensureReady(); sendJson(res, 200, { ok: true, threadId: codex.threadId, activeTurn: Boolean(codex.activeTurn), queueDepth: codex.queueDepth }); }
     catch (error) { sendJson(res, 503, { ok: false, error: error instanceof Error ? error.message : String(error) }); }
     return;
   }
@@ -391,4 +443,5 @@ server.listen(PORT, HOST, () => {
   console.log('[codex-bridge] Uses your existing Codex ChatGPT login; no OpenAI API key is required.');
   console.log('[codex-bridge] EasyEDA MCP auto-approval + live stock-search policy enabled.');
   console.log(`[codex-bridge] Generic Golden Schematic method v${SCHEMATIC_METHOD_VERSION} enabled (7805 is regression example only).`);
+  console.log('[codex-bridge] Serialized Codex turn queue enabled; overlapping EasyEDA requests will wait instead of failing.');
 });
