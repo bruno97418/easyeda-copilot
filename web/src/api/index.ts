@@ -96,12 +96,9 @@ export async function fetchWithTask({
     const startTime = Date.now();
     let lastStatusUpdateTime = startTime;
     let lastProgressMessage = 'Processing...';
-    const noUpdateTimeoutMs = 5000; // Если нет обновлений 5 сек, принудительно обновляем UI
+    const noUpdateTimeoutMs = 5000;
 
-    // support cancellation via AbortSignal passed in fetchOptions.signal
     const signal: AbortSignal | null | undefined = fetchOptions?.signal;
-
-    // Handle abort signal by sending cancel request to server
     let abortHandler: (() => Promise<void>) | undefined;
     if (signal) {
         abortHandler = async () => {
@@ -120,18 +117,12 @@ export async function fetchWithTask({
 
     try {
         while (true) {
-            if (signal?.aborted) {
-                throw new Error('Operation aborted');
-            }
-
-            if (Date.now() - startTime > timeoutMs) {
-                throw new Error(`Operation timed out after ${timeoutMs} ms`);
-            }
+            if (signal?.aborted) throw new Error('Operation aborted');
+            if (Date.now() - startTime > timeoutMs) throw new Error(`Operation timed out after ${timeoutMs} ms`);
 
             const statusRes = await fetchEda(statusUrl, { ...fetchOptions, headers: { 'Authorization': authorization, ...fetchOptions.headers } });
             if (!statusRes.ok) {
                 if (statusRes.status === 404) {
-                    // wait but allow abort
                     await new Promise((res, rej) => {
                         const t = setTimeout(() => res(undefined), pollIntervalMs);
                         if (signal) {
@@ -148,44 +139,29 @@ export async function fetchWithTask({
             }
 
             const op: { status: string, result: any, error: string, intermediateResult: { action: string } } = await statusRes.json();
-
             const currentAction = op?.intermediateResult?.action;
 
-            // Проверяем, изменилось ли действие
             if (currentAction && currentAction !== lastProgressMessage) {
-                // Новое действие - обновляем
                 onProgress?.(currentAction);
                 lastStatusUpdateTime = Date.now();
                 lastProgressMessage = currentAction;
             } else {
-                // Действие не изменилось - проверяем, долго ли оно не меняется
                 const timeSinceLastUpdate = Date.now() - lastStatusUpdateTime;
                 if (timeSinceLastUpdate > noUpdateTimeoutMs) {
                     const elapsedSeconds = Math.round((Date.now() - lastStatusUpdateTime) / 1000);
-                    const statusMessage = `${lastProgressMessage} (${elapsedSeconds}s)`;
-                    onProgress?.(statusMessage);
+                    onProgress?.(`${lastProgressMessage} (${elapsedSeconds}s)`);
                 }
-            }
-
-            if (signal?.aborted) {
-                throw new Error('Operation aborted');
             }
 
             if (op.status === 'completed') {
                 if (op.result === undefined) throw new Error('Result missing');
                 return op.result;
             }
-            if (op.status === 'failed') {
-                throw new Error(op.error || 'Operation failed');
-            }
-
+            if (op.status === 'failed') throw new Error(op.error || 'Operation failed');
             await new Promise(res => setTimeout(res, pollIntervalMs));
         }
     } finally {
-        // Clean up abort listener
-        if (signal && abortHandler) {
-            signal.removeEventListener('abort', abortHandler);
-        }
+        if (signal && abortHandler) signal.removeEventListener('abort', abortHandler);
     }
 }
 
@@ -205,40 +181,27 @@ export async function fetchSSE({
         body: typeof body === 'string' ? body : JSON.stringify(body),
         openWhenHidden: true,
         signal: signal,
-
-        onclose: () => {
-            onclose?.();
-        },
-
+        onclose: () => onclose?.(),
         onerror: (e) => {
             onerror?.(e);
             throw new Error(e);
         },
-
         onmessage: (msg) => {
             if (msg.event === 'FatalError' || msg.event === 'error') {
                 let errMes: string;
-                try {
-                    errMes = JSON.parse(msg.data).error || "Server error";
-                }
-                catch (e) {
-                    errMes = msg.data || "Server error";
-                }
-
+                try { errMes = JSON.parse(msg.data).error || "Server error"; }
+                catch (e) { errMes = msg.data || "Server error"; }
                 throw new Error(errMes);
             }
-
             onmessage?.(msg)
         },
-
         async onopen(response) {
             if (response.ok && response.headers.get('content-type')?.includes(EventStreamContentType)) {
                 await onopen?.(response)
                 return;
             } else if (response.status >= 400 && response.status < 500 && response.status !== 429) {
                 throw new Error('Fail to connect');
-            }
-            else if (response.status === 500) {
+            } else if (response.status === 500) {
                 const json = await response.json();
                 throw new Error(json.error || 'Operation failed');
             } else {
@@ -255,7 +218,6 @@ export async function fetchSSETask({
     let streamId;
 
     if (!prevStreamId) {
-        // 1) Create a stream on the server
         const startRes = await fetchEda(apiUrl + url + '/new', {
             method: 'POST',
             signal,
@@ -282,8 +244,6 @@ export async function fetchSSETask({
 
     const streamUrl = apiUrl + url + '/' + encodeURIComponent(streamId);
     let stopReceived = false;
-
-    // support cancellation via AbortSignal passed in signal
     let abortHandler: (() => Promise<void>) | undefined;
     if (signal) {
         abortHandler = async () => {
@@ -322,48 +282,33 @@ export async function fetchSSETask({
                     },
                     openWhenHidden: true,
                     signal: signal,
-
-                    onclose: () => {
-                        onclose?.();
-                    },
-
+                    onclose: () => onclose?.(),
                     onerror: (e) => {
                         onerror?.(e);
                         throw e;
                     },
-
                     onmessage: (msg) => {
                         if (msg.id) lastEventId = msg.id;
                         attempts = 0;
 
                         if (msg.event === 'FatalError' || msg.event === 'error') {
                             let errMes: string;
-                            try {
-                                errMes = JSON.parse(msg.data).error || "Server error";
-                            }
-                            catch (e) {
-                                errMes = msg.data || "Server error";
-                            }
-
+                            try { errMes = JSON.parse(msg.data).error || "Server error"; }
+                            catch (e) { errMes = msg.data || "Server error"; }
                             stopReceived = true;
                             throw new Error(errMes);
                         }
 
-                        if (msg.event === 'end') {
-                            stopReceived = true;
-                        }
-
+                        if (msg.event === 'end') stopReceived = true;
                         onmessage?.(msg)
                     },
-
                     async onopen(response) {
                         if (response.ok && response.headers.get('content-type')?.includes(EventStreamContentType)) {
                             await onopen?.(response, streamId)
                             return;
                         } else if (response.status >= 400 && response.status < 500 && response.status !== 429) {
                             throw new Error('Fail to connect');
-                        }
-                        else if (response.status === 500) {
+                        } else if (response.status === 500) {
                             const json = await response.json();
                             throw new Error(json.error || 'Operation failed');
                         } else {
@@ -372,29 +317,25 @@ export async function fetchSSETask({
                     },
                 });
 
-                await new Promise<void>((resolve, reject) => setTimeout(resolve, 1000))
-                // fetchEventSource resolved without throwing — if stop received, break; else treat as transient and retry
+                await new Promise<void>((resolve) => setTimeout(resolve, 1000))
                 if (stopReceived) break;
-                // otherwise, increment attempts and retry
                 attempts++;
             } catch (err) {
                 attempts++;
                 if (signal?.aborted) throw err;
                 if (attempts >= 3 || stopReceived) throw err;
-                // small backoff before retry
                 await new Promise(res => setTimeout(res, 1000));
             }
         }
 
         return;
     } finally {
-        // Clean up abort listener
-        if (signal && abortHandler) {
-            signal.removeEventListener('abort', abortHandler);
-        }
+        if (signal && abortHandler) signal.removeEventListener('abort', abortHandler);
     }
 }
 
-// @ts-ignore
-export const apiUrl = __MODE__ === 'DEV' ? 'http://localhost:5120' : 'https://circuit.tech.ru.net';
+// This fork intentionally routes the integrated EasyEDA Copilot UI to the local
+// Codex bridge. Authentication is provided by the existing Codex/ChatGPT login,
+// so no OpenAI API key or EasyEDA cloud login is required for chat.
+export const apiUrl = __MODE__ === 'DEV' ? 'http://localhost:5120' : 'http://127.0.0.1:8790';
 export const authorization = 'Basic Y2lyY3VpdDp4eU9BTE5INHBmb05HNjB2VmtBNTg0MTg=';
